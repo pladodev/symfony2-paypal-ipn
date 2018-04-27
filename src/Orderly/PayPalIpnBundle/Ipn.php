@@ -5,6 +5,7 @@ namespace Orderly\PayPalIpnBundle;
 use Symfony\Component\DependencyInjection as DI;
 use Symfony\Component\BrowserKit\Response;
 use Symfony\Component\BrowserKit\Request;
+use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
 
 /*
  * Copyright 2012 Orderly Ltd 
@@ -53,12 +54,11 @@ use Symfony\Component\BrowserKit\Request;
  * This library is inspired by:
  *  - Ran Aroussi's PayPal_Lib for CodeIgniter, http://aroussi.com/ci/
  *  - Micah Carrick's Paypal PHP class, http://www.micahcarrick.com
- * 
+ *
  * This library is ported from existing Codeigniter PayPal IPN library available at:
  * https://github.com/orderly/codeigniter-paypal-ipn
  *
  */
-
 class Ipn
 {
     private $_sc; // Symfony container
@@ -92,7 +92,7 @@ class Ipn
 
     /** The constructor. Loads the helpers and configuration files, sets the configuration constants
      *
-     * @param DI\ContainerInterface $container 
+     * @param DI\ContainerInterface $container
      */
     function __construct(DI\ContainerInterface $container, $objectManager, $ipnLog, $ipnOrders, $ipnOrderItems)
     {
@@ -124,8 +124,8 @@ class Ipn
      *    ID returned in the IPN message. You may need to store transaction IDs returned by IPN messages in a file or database so
      *    that you can check for duplicates. If the transaction ID sent by PayPal is a duplicate, you should not process it again."
      *    Actually PayPal is wrong on this last one - duplicate transaction IDs are fine, PayPal can send multiple different
-     *    messages with the same transaction ID. That's why we store the md5 instead. 
-     * 
+     *    messages with the same transaction ID. That's why we store the md5 instead.
+     *
      * @return bool
      */
     public function validateIPN()
@@ -136,7 +136,12 @@ class Ipn
         $this->transactionType = null;
 
         $usingCache = FALSE;
-        $request = $this->_sc->get('request');
+        try {
+            $request = $this->_sc->get('request');
+        } catch (ServiceNotFoundException $e) {
+            $request = $this->_sc->get('request_stack')->getCurrentRequest();
+        }
+
 
         //get post parameters
         $parameters = $request->request->all();
@@ -155,12 +160,12 @@ class Ipn
                     $usingCache = TRUE;
                 } else {
                     $this->_logTransaction('IPN', 'ERROR', 'No POST data and no cached IPN data');
-                    
+
                     return FALSE;
                 }
             } else {// Not in debug mode
                 $this->_logTransaction('IPN', 'ERROR', 'No POST data'); // Nulls because we don't have a transaction type or ID yet
-                
+
                 return FALSE;
             }
         }
@@ -173,7 +178,7 @@ class Ipn
         foreach (array_keys($ipnDataRaw) as $field) {
             if (!$usingCache) {
                 $value = $request->request->get($field);
-                if(strpos($value, "\r\n") === false){
+                if (strpos($value, "\r\n") === false) {
                     // Put line feeds back to \r\n for PayPal otherwise multi-line data will be rejected as INVALID
                     $ipnDataRaw[$field] = str_replace("\n", "\r\n", $value);
                 }
@@ -182,7 +187,7 @@ class Ipn
             // Let's also store this in this class, turning empty strings back to null to avoid breaking Doctrine later
             $this->ipnData[$field] = ($ipnDataRaw[$field] == '') ? null : $ipnDataRaw[$field];
         }
-        
+
         // Let's now set the transaction type and transaction ID, we'll use these for logging.
         $this->transactionID = (isset($this->ipnData['txn_id']) ? $this->ipnData['txn_id'] : null);
         $this->transactionType = (isset($this->ipnData['txn_type']) ? $this->ipnData['txn_type'] : null);
@@ -192,15 +197,15 @@ class Ipn
         $ipnDataHash = md5(serialize($ipnDataRaw));
         if (!$usingCache && $this->_checkForDuplicates($ipnDataHash)) {
             $this->_logTransaction('IPN', 'ERROR', 'This is a duplicate call: md5 hash ' . $ipnDataHash . ' already logged');
-            
+
             return FALSE;
         }
 
         // Now we need to ask PayPal to tell us if it sent this notification
         $ipnResponse = $this->_postData($this->ipnURL, array_merge(
-                                                                    array('cmd' => '_notify-validate'),
-                                                                    $ipnDataRaw
-                                                            ));
+            array('cmd' => '_notify-validate'),
+            $ipnDataRaw
+        ));
         if ($ipnResponse === FALSE) { // Bail out if we have an error.
             return FALSE;
         }
@@ -209,15 +214,17 @@ class Ipn
         if ($ipnResponse === "INVALID") {
             // Invalid IPN transaction.  Check the log for details.
             $this->_logTransaction('IPN', 'ERROR', 'PayPal rejected the IPN call as invalid - potentially call was spoofed or was not checked within 30s', $ipnResponse);
-            
+
             return FALSE;
         }
 
         // The IPN transaction is a genuine one - now we need to validate its contents.
         // First we check that the receiver email matches our email address.
-        if ($this->ipnData['receiver_email'] != $this->merchantEmail) {
-            $this->_logTransaction('IPN', 'ERROR', 'Receiver email ' . $this->ipnData['receiver_email'] . ' does not match merchant\'s email "'.$this->merchantEmail.'"', $ipnResponse);
-            
+//        if ($this->ipnData['receiver_email'] != $this->merchantEmail) {
+        if (($this->ipnData['receiver_email'] != "" && $this->ipnData['receiver_email'] != $this->merchantEmail) || ($this->ipnData['receiver_email'] == "" && $this->ipnData['business'] != $this->merchantEmail)) {
+
+            $this->_logTransaction('IPN', 'ERROR', 'Receiver email ' . $this->ipnData['receiver_email'] . ' does not match merchant\'s email "' . $this->merchantEmail . '"', $ipnResponse);
+
             return FALSE;
         }
 
@@ -225,17 +232,17 @@ class Ipn
         $testIPN = (isset($this->ipnData['test_ipn']) && $this->ipnData['test_ipn'] == 1);
         if ($testIPN == $this->isLive) {
             $this->_logTransaction('IPN', 'ERROR', 'Listener\'s environment does not match test_ipn flag ' . $this->ipnData['test_ipn'], $ipnResponse);
-            
+
             return FALSE;
         }
-        
+
         // Check if IPN is an subscription signup notification
         // because subscription signups don't have a payment_status
-        if (isset($this->ipnData['txn_type']) && $this->ipnData['txn_type'] == 'subscr_signup'){
+        if (isset($this->ipnData['txn_type']) && $this->ipnData['txn_type'] == 'subscr_signup') {
             $this->_logTransaction('IPN', 'SUCCESS', 'Subscription has been created', $ipnResponse);
             return true;
         }
-        
+
         // Check if paypal submits information regarding a case
         // because cases don't have a payment_status
         if ((isset($this->ipnData['txn_type']) && ($this->ipnData['txn_type'] == 'new_case' || $this->ipnData['txn_type'] == 'adjustment')) || isset($this->ipnData['case_type']) && $this->ipnData['case_type'] == 'chargeback') {
@@ -273,7 +280,7 @@ class Ipn
                 break;
             default:
                 $this->_logTransaction('IPN', 'ERROR', 'Payment status of ' . $this->ipnData['payment_status'] . ' is not recognised', $ipnResponse);
-                
+
                 return FALSE;
         }
 
@@ -289,82 +296,81 @@ class Ipn
     {
         $this->order = new $this->clsIpnOrders;
         // First extract the actual order record itself
-        foreach ($this->ipnData as $key=>$value) {
+        foreach ($this->ipnData as $key => $value) {
             // This is very simple: the order fields are any fields which do not end in a number
             // (because those fields belong to the order items)
             // period, amount, mcAmount ends with number and belongs to order. Think condition line should be commented
-            if (preg_match("/.*?(\d+)$/", $key) == 0){
+            if (preg_match("/.*?(\d+)$/", $key) == 0) {
                 //this code iterate over ipnData fields, check if order have related field and set it
-                $parts = explode('_',$key);
-                foreach($parts as $i => $part)
-                    $parts[$i] = ucfirst ($part);
-                $method = join('',$parts);
-                $method = 'set'.$method;
-                if(method_exists($this->order, $method))
+                $parts = explode('_', $key);
+                foreach ($parts as $i => $part)
+                    $parts[$i] = ucfirst($part);
+                $method = join('', $parts);
+                $method = 'set' . $method;
+                if (method_exists($this->order, $method))
                     $this->order->$method($value);
             }
         }
 
         // Let's store the payment status too
         $this->order->setOrderStatus($this->orderStatus);
-        
+
         //Updating dates
-        if(!$this->order->getCreatedAt())
+        if (!$this->order->getCreatedAt())
             $this->order->setCreatedAt(new \DateTime());
         $this->order->setUpdatedAt(new \DateTime());
 
-    
+
         // Now retrieve the line items which belong to this order
         $hasCart = ($this->order->getTxnType() == 'cart');
         $numItems = $hasCart ? (int)$this->order->getNumCartItems() : 1;
 
         $totalBeforeDiscount = 0;
         for ($i = 0; $i < $numItems; $i++) {
-            
+
             // Suffixes are different depending on whether there are multiple items (a cart) or not
             $suffix = $hasCart ? ($i + 1) : '';
             $suffixUnderscore = $hasCart ? '_' . $suffix : $suffix;
 
             $this->orderItems[$i] = new $this->clsIpnOrderItems;
-            if(isset($this->ipnData['item_name' . $suffix]))
+            if (isset($this->ipnData['item_name' . $suffix]))
                 $this->orderItems[$i]->setItemName($this->ipnData['item_name' . $suffix]);
-            if(isset($this->ipnData['item_number' . $suffix]))
+            if (isset($this->ipnData['item_number' . $suffix]))
                 $this->orderItems[$i]->setItemNumber($this->ipnData['item_number' . $suffix]);
-            if(isset($this->ipnData['quantity' . $suffix]))
+            if (isset($this->ipnData['quantity' . $suffix]))
                 $this->orderItems[$i]->setQuantity($this->ipnData['quantity' . $suffix]);
-            if(isset($this->ipnData['mc_gross' . $suffixUnderscore]))
+            if (isset($this->ipnData['mc_gross' . $suffixUnderscore]))
                 $this->orderItems[$i]->setMcGross($this->ipnData['mc_gross' . $suffixUnderscore]);
-            if(isset($this->ipnData['mc_gross' . $suffixUnderscore]) && isset($this->ipnData['quantity' . $suffix]))
+            if (isset($this->ipnData['mc_gross' . $suffixUnderscore]) && isset($this->ipnData['quantity' . $suffix]))
                 $this->orderItems[$i]->setCostPerItem(floatval($this->ipnData['mc_gross' . $suffixUnderscore]) / intval($this->ipnData['quantity' . $suffix])); // Should be fine because quantity can never be 0
-            
+
             // Update the total before the discount was applied
-            $totalBeforeDiscount +=  $this->orderItems[$i]->getMcGross();
-            
-            if(isset($this->ipnData['mc_handling' . $suffix]))
+            $totalBeforeDiscount += $this->orderItems[$i]->getMcGross();
+
+            if (isset($this->ipnData['mc_handling' . $suffix]))
                 $this->orderItems[$i]->setMcHandling($this->ipnData['mc_handling' . $suffix]);
-            if(isset($this->ipnData['mc_shipping' . $suffix]))
+            if (isset($this->ipnData['mc_shipping' . $suffix]))
                 $this->orderItems[$i]->setMcShipping($this->ipnData['mc_shipping' . $suffix]);
-            if(isset($this->ipnData['tax' . $suffix]))
+            if (isset($this->ipnData['tax' . $suffix]))
                 $this->orderItems[$i]->setTax($this->ipnData['tax' . $suffix]); // Tax is not always set on an item
-                        
-            
+
+
             // Set the order item options if any
             // $count = 7 because PayPal allows you to set a maximum of 7 options per item
             // Reference: https://cms.paypal.com/us/cgi-bin/?cmd=_render-content&content_ID=developer/e_howto_html_Appx_websitestandard_htmlvariables
-            for ($ii = 1, $count = 7; $ii < $count; $ii++)
-            {
-                if(isset($this->ipnData['option_name'.$ii.$suffixUnderscore])) {
+            for ($ii = 1, $count = 7; $ii < $count; $ii++) {
+                if (isset($this->ipnData['option_name' . $ii . $suffixUnderscore])) {
                     $method = 'setOptionName' . $ii;
-                    $this->orderItems[$i]->$method($this->ipnData['option_name'.$ii.$suffixUnderscore]);
+                    $this->orderItems[$i]->$method($this->ipnData['option_name' . $ii . $suffixUnderscore]);
                 }
-                if(isset($this->ipnData['option_selection'.$ii.$suffixUnderscore])) {
+                if (isset($this->ipnData['option_selection' . $ii . $suffixUnderscore])) {
                     $method = 'setOptionSelection' . $ii;
-                    $this->orderItems[$i]->$method($this->ipnData['option_selection'.$ii.$suffixUnderscore]);
+                    $this->orderItems[$i]->$method($this->ipnData['option_selection' . $ii . $suffixUnderscore]);
                 }
             }
-            
+
             //Updating dates
-            if(!$this->orderItems[$i]->getCreatedAt())
+            if (!$this->orderItems[$i]->getCreatedAt())
                 $this->orderItems[$i]->setCreatedAt(new \DateTime());
             $this->orderItems[$i]->setUpdatedAt(new \DateTime());
         }
@@ -375,10 +381,10 @@ class Ipn
 
     /**
      * sending data to PayPal IPN service
-     * 
+     *
      * @param string $url
      * @param array $postData
-     * 
+     *
      * @return string
      */
     function _postData($url, $postData)
@@ -389,7 +395,7 @@ class Ipn
 
         // Put the postData into a string
         $postString = '';
-        foreach ($postData as $field=>$value) {
+        foreach ($postData as $field => $value) {
             $postString .= $field . '=' . urlencode(stripslashes($value)) . '&'; // Trailing & at end of post string is forgivable
         }
 
@@ -427,19 +433,19 @@ class Ipn
         return FALSE;
     }
 
-    /** 
-     * Code below this point is all ORM-specific. In this version, it is dependent on Doctrine 2 
+    /**
+     * Code below this point is all ORM-specific. In this version, it is dependent on Doctrine 2
      * Save an IPN record (insert/update depending on if there is an existing row or not)
-     * 
+     *
      * @param array $ipnDataRaw
      */
     function _cacheIPN($ipnDataRaw)
     {
         $om = $this->objectManager;
-        
+
         // If we don't already have a cache row,
         if (!($cache = $om->getRepository($this->clsIpnLog)
-                ->findOneBy(array('listenerName' => 'IPN', 'transactionType' => 'cache')))) {
+            ->findOneBy(array('listenerName' => 'IPN', 'transactionType' => 'cache')))) {
 
             $cache = new $this->clsIpnLog; // Create a new one
             $cache->setListenerName('IPN');
@@ -448,7 +454,7 @@ class Ipn
 
         // Let's log the raw IPN data - either update or insert
         $cache->setDetail(serialize($ipnDataRaw));
-        if(!$cache->getCreatedAt())
+        if (!$cache->getCreatedAt())
             $cache->setCreatedAt(new \DateTime());
         $cache->setUpdatedAt(new \DateTime());
         $om->persist($cache);
@@ -457,7 +463,7 @@ class Ipn
 
     /**
      * Retrieve the cached IPN record if there is one, false if there isn't
-     * 
+     *
      * @return array
      */
     function _getCachedIPN()
@@ -465,7 +471,7 @@ class Ipn
         $om = $this->objectManager;
 
         if (!($cache = $om->getRepository($this->clsIpnLog)
-                ->findOneBy(array('listenerName' => 'IPN', 'transactionType' => 'cache')))) {
+            ->findOneBy(array('listenerName' => 'IPN', 'transactionType' => 'cache')))) {
             return FALSE;
         } else {
             return unserialize($cache->getDetail());
@@ -474,14 +480,14 @@ class Ipn
 
     /**
      *  Check for a duplicate IPN call using the md5 hash
-     * 
+     *
      * @param string $hash
      * @return IpnLog
      */
     function _checkForDuplicates($hash)
     {
         return $this->objectManager->getRepository($this->clsIpnLog)
-                ->findOneByIpnDataHash($hash);
+            ->findOneByIpnDataHash($hash);
     }
 
     /**
@@ -495,7 +501,7 @@ class Ipn
 
         // First check if the order needs an insert or an update
         if (($ipnOrder = $om->getRepository($this->clsIpnOrders)
-                ->findOneByTxnId($this->ipnData['txn_id']))) {
+            ->findOneByTxnId($this->ipnData['txn_id']))) {
             $this->order->setId($ipnOrder->getId());//Update
             $om->merge($this->order);// Let's save/merge the order down
         } else {
@@ -507,13 +513,13 @@ class Ipn
         foreach ($this->orderItems as $i => $item) {
             // We need to check if we have already saved this into the database...
             if (($ipnOrderItem = $om->getRepository($this->clsIpnOrderItems)
-                    ->findOneBy(array('itemName' => $item->getItemName(), 'orderId' => $this->order->getId())))) {
+                ->findOneBy(array('itemName' => $item->getItemName(), 'orderId' => $this->order->getId())))) {
                 $this->orderItems[$i]->setId($ipnOrderItem->getId()); //Update
                 $this->orderItems[$i]->setOrderId($this->order->getId()); // set related order
                 $om->merge($this->orderItems[$i]);// Let's save/merge the order down
             } else {
                 $om->persist($this->orderItems[$i]); //If not exist in database, create new
-            }          
+            }
             $this->orderItems[$i]->setOrderId($this->order->getId());
         }
         // Let's store all of the data (order and order items)
@@ -525,7 +531,7 @@ class Ipn
      * - Successful and failed calls by the PayPal IPN
      * - Successful and failed calls by one or more third-party APIs
      * - (In sandbox mode) Caches the last transaction fields so we can run the IPN script directly
-     *  
+     *
      * @param string $listenerName
      * @param string $transactionStatus
      * @param string $transactionMessage
@@ -536,22 +542,22 @@ class Ipn
         // Store the standard log information
         $om = $this->objectManager;
         if (!is_null($this->logID)) {
-            $ipnLog  = $om->getRepository($this->clsIpnLog)->find($this->logID);
+            $ipnLog = $om->getRepository($this->clsIpnLog)->find($this->logID);
         } else {
             $ipnLog = new $this->clsIpnLog;
         }
-        
+
         $ipnLog->setListenerName($listenerName);
         $ipnLog->setTransactionType($this->transactionType);
         $ipnLog->setTransactionId($this->transactionID);
         $ipnLog->setStatus($transactionStatus);
         $ipnLog->setMessage($transactionMessage);
         $ipnLog->setIpnDataHash(md5(serialize($this->ipnData)));
-        
-        if(!$ipnLog->getCreatedAt())
+
+        if (!$ipnLog->getCreatedAt())
             $ipnLog->setCreatedAt(new \DateTime());
         $ipnLog->setUpdatedAt(new \DateTime());
-        
+
         // We also log the ipnResponse and the ipnData if we have an error and/or are in the sandbox (test) environment.
         if ($transactionStatus == 'ERROR' || !$this->isLive) {
             $detailJSON = array();
@@ -565,39 +571,39 @@ class Ipn
         // Finally save down the log record.
         $om->persist($ipnLog);
         $om->flush();
-            
+
 
         if (is_null($this->logID)) {
             $this->logID = $ipnLog->getId(); // Save the log ID for next time if we need to.
         }
     }
-    
+
     //getters for Ipn private properties
-    
+
     /**
      * Get orderStatus
      *
-     * @return string 
+     * @return string
      */
     public function getOrderStatus()
     {
         return $this->orderStatus;
     }
-    
+
     /**
      * Get order
      *
-     * @return object 
+     * @return object
      */
     public function getOrder()
     {
         return $this->order;
     }
-    
+
     /**
      * Get orderItems
      *
-     * @return array 
+     * @return array
      */
     public function getOrderItems()
     {
